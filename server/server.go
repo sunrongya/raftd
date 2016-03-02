@@ -15,6 +15,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"net/url"
+	"net/http/httputil"
+	"errors"
 )
 
 // The raftd server is a combination of the Raft server and an HTTP
@@ -134,19 +137,42 @@ func (s *Server) Join(leader string) error {
 	}
 
 	var b bytes.Buffer
-	json.NewEncoder(&b).Encode(command)
+	if err := json.NewEncoder(&b).Encode(command); err != nil {
+		return nil
+	}
+
 	resp, err := http.Post(fmt.Sprintf("http://%s/join", leader), "application/json", &b)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	// Look for redirect.
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		leader := resp.Header.Get("Location")
+		if leader == "" {
+			return errors.New("Redirect requested, but no location header supplied")
+		}
+		u, err := url.Parse(leader)
+		if err != nil {
+			return errors.New("Failed to parse redirect location")
+		}
+		log.Printf("Redirecting to leader at %s", u.Host)
+		return s.Join(u.Host)
+	}
 
 	return nil
 }
 
 func (s *Server) joinHandler(w http.ResponseWriter, req *http.Request) {
+	if s.raftServer.State() != "leader" {
+		s.leaderRedirect(w, req)
+		return
+	}
+	
 	command := &raft.DefaultJoinCommand{}
-
 	if err := json.NewDecoder(req.Body).Decode(&command); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -164,6 +190,12 @@ func (s *Server) readHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *Server) writeHandler(w http.ResponseWriter, req *http.Request) {
+	if s.raftServer.State() != "leader" {
+		s.leaderProxy(w, req)
+		//s.leaderRedirect(w, req)
+		return
+	}
+	
 	vars := mux.Vars(req)
 
 	// Read the value from the POST body.
@@ -179,4 +211,58 @@ func (s *Server) writeHandler(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
+}
+
+// leaderRedirect returns a 307 Temporary Redirect, with the full path
+// to the leader.
+func (s *Server) leaderRedirect(w http.ResponseWriter, r *http.Request) {
+	peers := s.raftServer.Peers()
+	leader := peers[s.raftServer.Leader()]
+
+	if leader == nil {
+		// No leader available, give up.
+		// log.Error("attempted leader redirection, but no leader available")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("no leader available"))
+		return
+	}
+
+	var u string
+	for _, p := range peers {
+		if p.Name == leader.Name {
+			u = p.ConnectionString
+			break
+		}
+	}
+	http.Redirect(w, r, u+r.URL.Path, http.StatusTemporaryRedirect)
+}
+
+func (s *Server) leaderProxy(w http.ResponseWriter, r *http.Request) {
+	peers := s.raftServer.Peers()
+	leader := peers[s.raftServer.Leader()]
+
+	if leader == nil {
+		// No leader available, give up.
+		// log.Error("attempted leader redirection, but no leader available")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("no leader available"))
+		return
+	}
+
+	var u string
+	for _, p := range peers {
+		if p.Name == leader.Name {
+			u = p.ConnectionString
+			break
+		}
+	}
+    
+	targetUrl, err := url.Parse(u)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("no leader available Parse"))
+		return
+	}
+	proxy := httputil.NewSingleHostReverseProxy(targetUrl)
+	proxy.ServeHTTP(w, r)
 }
